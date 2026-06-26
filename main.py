@@ -33,11 +33,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, whoami
 from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
 
 logging.basicConfig(
@@ -45,7 +46,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+# Couper les logs HTTP de httpx et urllib3 pour avoir un terminal propre
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 log = logging.getLogger("server")
 
 DB_PATH = "animezone.db"
@@ -59,7 +64,6 @@ LOCK_TIMEOUT = 60
 SCRAPE_INTERVAL = 6 * 3600
 CHECKPOINT_INTERVAL = 50
 
-app = FastAPI()
 hf_api: HfApi | None = None
 hf_token: str | None = None
 hf_repo: str = ""
@@ -68,6 +72,15 @@ is_active = False
 scrap_process: subprocess.Popen | None = None
 last_checkpoint_count = 0
 shutdown_event = asyncio.Event()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(server_loop())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
@@ -119,6 +132,7 @@ async def hf_upload(local_path: str, remote_path: str) -> bool:
 
 
 async def ensure_hf_repo():
+    global hf_repo
     try:
         await asyncio.to_thread(hf_api.repo_info, repo_id=hf_repo, repo_type="dataset")
     except Exception:
@@ -361,7 +375,7 @@ def main():
     global hf_api, hf_token, hf_repo, server_id
     parser = argparse.ArgumentParser(description="AnimeZone server coordinator")
     parser.add_argument("--hf", help="HuggingFace token (write access)")
-    parser.add_argument("--repo", default="animezone-catalog", help="HF dataset repo ID")
+    parser.add_argument("--repo", default="animezone-catalog", help="HF dataset repo ID (can be short name)")
     parser.add_argument(
         "--port", type=int, default=int(os.environ.get("PORT", 10000)), help="Port"
     )
@@ -372,9 +386,22 @@ def main():
     if not hf_token:
         print("Erreur: fournir --hf <token> ou set HF_TOKEN env var")
         sys.exit(1)
-    hf_repo = args.repo
-    server_id = args.server_id or os.environ.get("SERVER_ID") or socket.gethostname()
+    
     hf_api = HfApi(token=hf_token)
+    
+    # Construire le repo_id complet (username/repo-name)
+    if "/" not in args.repo:
+        try:
+            user_info = whoami(token=hf_token)
+            username = user_info["name"]
+            hf_repo = f"{username}/{args.repo}"
+        except Exception as e:
+            print(f"Erreur recup username HF: {e}")
+            sys.exit(1)
+    else:
+        hf_repo = args.repo
+
+    server_id = args.server_id or os.environ.get("SERVER_ID") or socket.gethostname()
 
     log.info("=== AnimeZone Server ===")
     log.info("Server ID : %s", server_id)
@@ -383,10 +410,6 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
-
-    @app.on_event("startup")
-    async def startup():
-        asyncio.create_task(server_loop())
 
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
 

@@ -22,7 +22,10 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+# Couper les logs HTTP de httpx et urllib3 pour avoir un terminal propre
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("cloudscraper").setLevel(logging.WARNING)
 log = logging.getLogger("scrap")
 
