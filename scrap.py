@@ -20,6 +20,8 @@ from urllib.parse import urlparse
 import cloudscraper
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+from huggingface_hub import HfApi, hf_hub_download, whoami
+from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 # Couper les logs HTTP de httpx et urllib3 pour avoir un terminal propre
@@ -1040,8 +1042,70 @@ def main():
     parser.add_argument("--state", default="state.json", help="Chemin state.json persistant")
     parser.add_argument("--max-animes", type=int, default=None, help="Limite (pour test)")
     parser.add_argument("--no-scrap", action="store_true", help="Convertir state → DB sans scraper")
+    
+    # Options HuggingFace sync
+    parser.add_argument("--hf", help="Token HuggingFace pour sync cloud")
+    parser.add_argument("--repo", default="animezone-catalog", help="Nom du repo HF")
+    parser.add_argument("--push", action="store_true", help="Push DB + state sur HF a la fin")
+    parser.add_argument("--pull", action="store_true", help="Pull state depuis HF au debut")
+    
     args = parser.parse_args()
+
+    # Setup HF si token fourni
+    hf_api = None
+    hf_repo = ""
+    if args.hf:
+        hf_api = HfApi(token=args.hf)
+        try:
+            user_info = whoami(token=args.hf)
+            username = user_info["name"]
+            hf_repo = f"{username}/{args.repo}" if "/" not in args.repo else args.repo
+            hf_api.create_repo(repo_id=hf_repo, repo_type="dataset", private=True, exist_ok=True)
+            log.info("HF sync active sur %s", hf_repo)
+        except Exception as e:
+            log.error("Erreur init HF: %s", e)
+            hf_api = None
+
+    # Pull state depuis HF si demandé
+    if args.pull and hf_api:
+        try:
+            log.info("Telechargement state.json depuis HF ...")
+            path = hf_hub_download(repo_id=hf_repo, filename="state.json", repo_type="dataset", token=args.hf)
+            import shutil
+            shutil.copy(path, args.state)
+            log.info("✓ state.json recupere")
+        except Exception:
+            log.info("Pas de state.json sur HF — demarrage from scratch")
+
     asyncio.run(run_scraper(args))
+
+    # Push vers HF si demandé
+    if args.push and hf_api:
+        log.info("Push des resultats sur HF ...")
+        if os.path.exists(args.db):
+            hf_api.upload_file(path_or_fileobj=args.db, path_in_repo="animezone.db", repo_id=hf_repo, repo_type="dataset")
+            log.info("✓ animezone.db pousse")
+        if os.path.exists(args.state):
+            hf_api.upload_file(path_or_fileobj=args.state, path_in_repo="state.json", repo_id=hf_repo, repo_type="dataset")
+            log.info("✓ state.json pousse")
+        # Generer et pousser le manifest
+        import sqlite3, time
+        if os.path.exists(args.db):
+            conn = sqlite3.connect(args.db)
+            c = conn.cursor()
+            manifest = {
+                "db_version": int(time.time()),
+                "last_update": int(time.time()),
+                "total_animes": c.execute("SELECT COUNT(*) FROM anime").fetchone()[0],
+                "total_episodes": c.execute("SELECT COUNT(*) FROM episode").fetchone()[0],
+                "total_urls": c.execute("SELECT COUNT(*) FROM episode_url").fetchone()[0],
+            }
+            conn.close()
+            import json as jjson
+            with open("/tmp/manifest.json", "w") as f:
+                jjson.dump(manifest, f, indent=2)
+            hf_api.upload_file(path_or_fileobj="/tmp/manifest.json", path_in_repo="manifest.json", repo_id=hf_repo, repo_type="dataset")
+            log.info("✓ manifest.json pousse: %d animes, %d eps", manifest["total_animes"], manifest["total_episodes"])
 
 
 if __name__ == "__main__":
