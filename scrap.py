@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import cloudscraper
 from bs4 import BeautifulSoup
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from huggingface_hub import HfApi, hf_hub_download, whoami
 from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
 
