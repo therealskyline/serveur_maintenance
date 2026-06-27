@@ -141,16 +141,21 @@ USER_AGENT = (
 
 # ==================================================================
 # V2.15 — Stable anime_id via hash MD5 de l'URL
+# V2.15.4 — Masque 0x7FFFFFFF pour garantir un ID dans la plage Int signé
+#           Java/Kotlin (max 2^31 - 1 = 2 147 483 647). Avant ce masque,
+#           ~50% des anime_id dépassaient Int.MAX_VALUE et causaient un
+#           overflow silencieux côté app → "Anime non trouvé".
 # ==================================================================
 def stable_anime_id(url: str) -> int:
     """
     Calcule un anime_id déterministe à partir de l'URL source.
 
     - 4 premiers octets du MD5 de l'URL normalisée (sans trailing slash)
-    - 32 bits → IDs entre 1 et ~4 milliards (jamais 0, qui est réservé)
+    - V2.15.4 : masque `& 0x7FFFFFFF` → 31 bits, IDs entre 0 et 2^31-1
+      (tient dans un Int signé Java/Kotlin, évite l'overflow côté app)
     - Même URL → même ID, peu importe l'ordre de scrap ou l'état du state
-    - Collisions : négligeables avec 4 octets pour ~1300 animes
-      (proba ~ 1e-7 d'avoir une collision avec 1300 entrées sur 4e9 espace)
+    - Collisions : négligeables avec 31 bits pour ~1300 animes
+      (proba ~ 1e-7 d'avoir une collision avec 1300 entrées sur 2e9 espace)
     """
     if not url:
         return 0
@@ -166,7 +171,8 @@ def stable_anime_id(url: str) -> int:
         pass
 
     digest = hashlib.md5(norm_url.encode("utf-8")).digest()
-    anime_id = int.from_bytes(digest[:4], "big")
+    # V2.15.4 : & 0x7FFFFFFF → garantit un ID positif dans la plage Int Java
+    anime_id = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
     # Éviter l'ID 0 (réservé pour "non trouvé")
     if anime_id == 0:
         anime_id = 1
