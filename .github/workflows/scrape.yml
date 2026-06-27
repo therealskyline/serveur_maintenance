@@ -30,7 +30,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python scrap.py --hf $HF_TOKEN --pull --push --concurrency 6
+          python scrap.py --hf $HF_TOKEN --pull --push
 
       - name: Commit state.json back to repo (cache)
         # Optionnel : garde une copie du state dans le repo pour debug
