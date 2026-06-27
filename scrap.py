@@ -19,10 +19,15 @@ from urllib.parse import urlparse
 
 import cloudscraper
 from bs4 import BeautifulSoup
-from tqdm import tqdm
+from tqdm.auto import tqdm
+from huggingface_hub import HfApi, hf_hub_download, whoami
+from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+# Couper les logs HTTP de httpx et urllib3 pour avoir un terminal propre
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("cloudscraper").setLevel(logging.WARNING)
 log = logging.getLogger("scrap")
 
@@ -30,21 +35,22 @@ REQUEST_DELAY = 0.3
 
 SCHEMA = """
 CREATE TABLE anime (
-    anime_id         INTEGER PRIMARY KEY,
-    title            TEXT NOT NULL,
-    title_normalized TEXT NOT NULL,
-    original_title   TEXT,
-    description      TEXT,
-    image            TEXT,
-    image_url        TEXT,
-    year             INTEGER,
-    status           TEXT,
-    rating           REAL,
-    featured         INTEGER DEFAULT 0,
-    has_episodes     INTEGER DEFAULT 0,
-    seasons_fetched  INTEGER DEFAULT 0,
-    languages        TEXT,
-    raw_json         TEXT NOT NULL
+    anime_id             INTEGER PRIMARY KEY,
+    title                TEXT NOT NULL,
+    title_normalized     TEXT NOT NULL,
+    original_title       TEXT,
+    alternative_titles   TEXT,
+    description          TEXT,
+    image                TEXT,
+    image_url            TEXT,
+    year                 INTEGER,
+    status               TEXT,
+    rating               REAL,
+    featured             INTEGER DEFAULT 0,
+    has_episodes         INTEGER DEFAULT 0,
+    seasons_fetched      INTEGER DEFAULT 0,
+    languages            TEXT,
+    raw_json             TEXT NOT NULL
 );
 CREATE TABLE genre (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,7 +180,7 @@ def split_and_strip(string: str, delimiters) -> list[str]:
 class ScraperClient:
     """Pool de sessions cloudscraper pour bypass Cloudflare + parallélisme."""
 
-    POOL_SIZE = 8
+    POOL_SIZE = 4
 
     def __init__(self):
         self._sessions = [
@@ -654,10 +660,20 @@ async def scrape_anime(
                 "episodes": episodes_out,
             })
 
+    # Les langues affichées dans le catalogue (drapeaux) sont souvent fausses.
+    # Anime-Sama affiche "VF" dès qu'il y a un drapeau FR, même si c'est en
+    # réalité du VJSTFR (japonais sous-titré FR). On utilise donc les langues
+    # RÉELLEMENT scrapées depuis les saisons comme source de vérité.
+    real_languages = set()
+    for season in seasons_out:
+        for episode in season.get("episodes", []):
+            real_languages.update(episode.get("languages", []))
+
     anime_out = {
         "anime_id": anime_id,
         "title": name,
         "original_title": catalogue["alternative_names"][0] if catalogue["alternative_names"] else None,
+        "alternative_titles": catalogue["alternative_names"],
         "description": synopsis,
         "image": image_url,
         "image_url": image_url,
@@ -668,7 +684,7 @@ async def scrape_anime(
         "has_episodes": 1 if seasons_out else 0,
         "seasons_fetched": 1,
         "genres": catalogue["genres"],
-        "languages": sorted(list(catalogue["languages"])),
+        "languages": sorted(list(real_languages)) if real_languages else sorted(list(catalogue["languages"])),
         "seasons": seasons_out,
     }
     return anime_out
@@ -751,6 +767,14 @@ def write_db(db_path: str, animes: list[dict]):
         conn.executescript(SCHEMA)
     else:
         log.info("Mise à jour incrémentale de la DB %s ...", db_path)
+        # Migration : ajouter la colonne alternative_titles si elle n'existe pas
+        try:
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(anime)").fetchall()]
+            if "alternative_titles" not in cols:
+                conn.execute("ALTER TABLE anime ADD COLUMN alternative_titles TEXT")
+                log.info("  → Colonne 'alternative_titles' ajoutée à la table anime")
+        except Exception as e:
+            log.warning("Migration alternative_titles: %s", e)
     c = conn.cursor()
     for anime in animes:
         _upsert_anime(c, anime)
@@ -773,12 +797,15 @@ def _upsert_anime(c, anime: dict):
 
     c.execute("""
         INSERT OR REPLACE INTO anime
-        (anime_id, title, title_normalized, original_title, description, image, image_url,
-         year, status, rating, featured, has_episodes, seasons_fetched, languages, raw_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (anime_id, title, title_normalized, original_title, alternative_titles,
+         description, image, image_url, year, status, rating, featured,
+         has_episodes, seasons_fetched, languages, raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         anime_id, anime.get("title", ""), normalize(anime.get("title", "")),
-        anime.get("original_title"), anime.get("description"),
+        anime.get("original_title"),
+        json.dumps(anime.get("alternative_titles", []), ensure_ascii=False),
+        anime.get("description"),
         anime.get("image"), anime.get("image_url"), anime.get("year"),
         anime.get("status"), float(anime.get("rating") or 0),
         1 if anime.get("featured") else 0,
@@ -930,74 +957,57 @@ async def run_scraper(args):
             dynamic_ncols=True,
             bar_format="{desc} {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt} [{rate_fmt}] ETA {remaining} | {postfix}",
         )
+        for idx, cat in enumerate(pbar, start=1):
+            url = cat["url"]
+            if url in state["animes_scraped"]:
+                anime_id = state["animes_scraped"][url]["anime_id"]
+            else:
+                anime_id = state["next_anime_id"]
+                state["next_anime_id"] += 1
+                state["animes_scraped"][url] = {"anime_id": anime_id, "name": cat["name"]}
 
-        # Parallélisme : on scrape plusieurs animes en même temps
-        concurrency = getattr(args, 'concurrency', 4)
-        sem = asyncio.Semaphore(concurrency)
-        state_lock = asyncio.Lock()
-        counters = {"new": 0, "updated": 0, "unchanged": 0}
+            is_new = url in new_urls
+            etat = "NOUVEAU" if is_new else "MAJ"
+            short_name = cat["name"][:40] + ("..." if len(cat["name"]) > 40 else "")
+            pbar.set_postfix_str(f"{short_name} [{etat}]")
 
-        async def scrape_one(idx, cat):
-            async with sem:
-                url = cat["url"]
-                if url in state["animes_scraped"]:
-                    anime_id = state["animes_scraped"][url]["anime_id"]
-                else:
-                    anime_id = state["next_anime_id"]
-                    state["next_anime_id"] += 1
-                    state["animes_scraped"][url] = {"anime_id": anime_id, "name": cat["name"]}
-
-                is_new = url in new_urls
-                etat = "NOUVEAU" if is_new else "MAJ"
-                short_name = cat["name"][:40] + ("..." if len(cat["name"]) > 40 else "")
-                pbar.set_postfix_str(f"{short_name} [{etat}]")
-
-                try:
-                    anime_data = await scrape_anime(client, cat, anime_id)
-                    old_data = state["animes_scraped"][url].get("data")
-                    if old_data:
-                        changes = []
-                        if old_data.get("title") != anime_data.get("title"):
-                            changes.append("titre changé")
-                        if old_data.get("description") != anime_data.get("description"):
-                            changes.append("description changée")
-                        if old_data.get("image") != anime_data.get("image"):
-                            changes.append("image changée")
-                        if set(old_data.get("genres", [])) != set(anime_data.get("genres", [])):
-                            changes.append("genres changés")
-                        old_eps = sum(len(s.get("episodes", [])) for s in old_data.get("seasons", []))
-                        new_eps = sum(len(s.get("episodes", [])) for s in anime_data.get("seasons", []))
-                        if new_eps > old_eps:
-                            changes.append(f"+{new_eps - old_eps} épisode(s)")
-                        old_seasons = len(old_data.get("seasons", []))
-                        new_seasons = len(anime_data.get("seasons", []))
-                        if new_seasons > old_seasons:
-                            changes.append(f"+{new_seasons - old_seasons} saison(s)")
-                        if changes:
-                            for change in changes:
-                                log.info("  → %s", change)
-                            counters["updated"] += 1
-                        else:
-                            counters["unchanged"] += 1
+            try:
+                anime_data = await scrape_anime(client, cat, anime_id)
+                old_data = state["animes_scraped"][url].get("data")
+                if old_data:
+                    changes = []
+                    if old_data.get("title") != anime_data.get("title"):
+                        changes.append(f"titre changé")
+                    if old_data.get("description") != anime_data.get("description"):
+                        changes.append("description changée")
+                    if old_data.get("image") != anime_data.get("image"):
+                        changes.append("image changée")
+                    if set(old_data.get("genres", [])) != set(anime_data.get("genres", [])):
+                        changes.append("genres changés")
+                    old_eps = sum(len(s.get("episodes", [])) for s in old_data.get("seasons", []))
+                    new_eps = sum(len(s.get("episodes", [])) for s in anime_data.get("seasons", []))
+                    if new_eps > old_eps:
+                        changes.append(f"+{new_eps - old_eps} épisode(s)")
+                    old_seasons = len(old_data.get("seasons", []))
+                    new_seasons = len(anime_data.get("seasons", []))
+                    if new_seasons > old_seasons:
+                        changes.append(f"+{new_seasons - old_seasons} saison(s)")
+                    if changes:
+                        for change in changes:
+                            log.info("  → %s", change)
+                        updated_count += 1
                     else:
-                        counters["new"] += 1
-                    state["animes_scraped"][url]["data"] = anime_data
-                    state["animes_scraped"][url]["last_scraped"] = int(time.time())
-                    animes_out.append(anime_data)
-                    if idx % 10 == 0:
-                        async with state_lock:
-                            save_state(state_path, state)
-                except Exception as e:
-                    log.error("  ✗ Erreur scrape %s : %s", url, e)
-                pbar.update(1)
-
-        tasks = [scrape_one(idx, cat) for idx, cat in enumerate(catalogues_to_scrape, start=1)]
-        await asyncio.gather(*tasks)
+                        unchanged_count += 1
+                else:
+                    new_count += 1
+                state["animes_scraped"][url]["data"] = anime_data
+                state["animes_scraped"][url]["last_scraped"] = int(time.time())
+                animes_out.append(anime_data)
+                if idx % 10 == 0:
+                    save_state(state_path, state)
+            except Exception as e:
+                log.error("  ✗ Erreur scrape %s : %s", url, e)
         pbar.close()
-
-        new_count = counters["new"]
-        updated_count = counters["updated"]
-        unchanged_count = counters["unchanged"]
 
         state["catalogue_seen_urls"] = list(current_urls)
         if not state["last_full_scrape"]:
@@ -1032,9 +1042,70 @@ def main():
     parser.add_argument("--state", default="state.json", help="Chemin state.json persistant")
     parser.add_argument("--max-animes", type=int, default=None, help="Limite (pour test)")
     parser.add_argument("--no-scrap", action="store_true", help="Convertir state → DB sans scraper")
-    parser.add_argument("--concurrency", type=int, default=4, help="Nombre d'animes scrapés en parallèle")
+    
+    # Options HuggingFace sync
+    parser.add_argument("--hf", help="Token HuggingFace pour sync cloud")
+    parser.add_argument("--repo", default="animezone-catalog", help="Nom du repo HF")
+    parser.add_argument("--push", action="store_true", help="Push DB + state sur HF a la fin")
+    parser.add_argument("--pull", action="store_true", help="Pull state depuis HF au debut")
+    
     args = parser.parse_args()
+
+    # Setup HF si token fourni
+    hf_api = None
+    hf_repo = ""
+    if args.hf:
+        hf_api = HfApi(token=args.hf)
+        try:
+            user_info = whoami(token=args.hf)
+            username = user_info["name"]
+            hf_repo = f"{username}/{args.repo}" if "/" not in args.repo else args.repo
+            hf_api.create_repo(repo_id=hf_repo, repo_type="dataset", private=True, exist_ok=True)
+            log.info("HF sync active sur %s", hf_repo)
+        except Exception as e:
+            log.error("Erreur init HF: %s", e)
+            hf_api = None
+
+    # Pull state depuis HF si demandé
+    if args.pull and hf_api:
+        try:
+            log.info("Telechargement state.json depuis HF ...")
+            path = hf_hub_download(repo_id=hf_repo, filename="state.json", repo_type="dataset", token=args.hf)
+            import shutil
+            shutil.copy(path, args.state)
+            log.info("✓ state.json recupere")
+        except Exception:
+            log.info("Pas de state.json sur HF — demarrage from scratch")
+
     asyncio.run(run_scraper(args))
+
+    # Push vers HF si demandé
+    if args.push and hf_api:
+        log.info("Push des resultats sur HF ...")
+        if os.path.exists(args.db):
+            hf_api.upload_file(path_or_fileobj=args.db, path_in_repo="animezone.db", repo_id=hf_repo, repo_type="dataset")
+            log.info("✓ animezone.db pousse")
+        if os.path.exists(args.state):
+            hf_api.upload_file(path_or_fileobj=args.state, path_in_repo="state.json", repo_id=hf_repo, repo_type="dataset")
+            log.info("✓ state.json pousse")
+        # Generer et pousser le manifest
+        import sqlite3, time
+        if os.path.exists(args.db):
+            conn = sqlite3.connect(args.db)
+            c = conn.cursor()
+            manifest = {
+                "db_version": int(time.time()),
+                "last_update": int(time.time()),
+                "total_animes": c.execute("SELECT COUNT(*) FROM anime").fetchone()[0],
+                "total_episodes": c.execute("SELECT COUNT(*) FROM episode").fetchone()[0],
+                "total_urls": c.execute("SELECT COUNT(*) FROM episode_url").fetchone()[0],
+            }
+            conn.close()
+            import json as jjson
+            with open("/tmp/manifest.json", "w") as f:
+                jjson.dump(manifest, f, indent=2)
+            hf_api.upload_file(path_or_fileobj="/tmp/manifest.json", path_in_repo="manifest.json", repo_id=hf_repo, repo_type="dataset")
+            log.info("✓ manifest.json pousse: %d animes, %d eps", manifest["total_animes"], manifest["total_episodes"])
 
 
 if __name__ == "__main__":
