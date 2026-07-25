@@ -549,8 +549,27 @@ async def fetch_all_catalogues(
     # Évite de scanner les 279 pages du catalogue juste pour tester un anime.
     nf_lower = name_filter.lower() if name_filter else None
 
+    # Beta 1.2 : garde-fous anti boucle infinie.
+    # Observé en prod : passé la dernière page réelle, le site ne renvoie ni
+    # empty_marker ni page vide — il "clampe" et renvoie indéfiniment la MÊME
+    # dernière page (ex: 4 cartes "Scans", toujours filtrées avant même le
+    # check anti-doublon). Résultat : la boucle tournait à l'infini (page 1169
+    # → 1321+... "0 nouveaux" mais "scans filtrés" +4 à chaque page, jusqu'au
+    # timeout du job 6h) sans jamais atteindre une condition d'arrêt existante.
+    #  1. prev_page_urls : si le set d'URLs de la page est identique à celui
+    #     de la page précédente → pagination clampée → fin réelle du catalogue.
+    #  2. HARD_PAGE_CAP : filet de sécurité si jamais le site renvoie du
+    #     contenu toujours différent mais jamais vide (autre anomalie non
+    #     prévue) — on ne veut jamais boucler indéfiniment.
+    prev_page_urls: set[str] | None = None
+    HARD_PAGE_CAP = 3000
+
     while True:
         if max_animes and len(all_catalogues) >= max_animes:
+            break
+        if page > HARD_PAGE_CAP:
+            log.error("Page %d : garde-fou HARD_PAGE_CAP=%d atteint — arrêt forcé "
+                       "(pagination probablement cassée côté site)", page, HARD_PAGE_CAP)
             break
         html = await client.get(f"{site_url}catalogue/?page={page}")
         if not html:
@@ -567,6 +586,13 @@ async def fetch_all_catalogues(
         if not page_catalogues:
             log.info("Page %d : 0 animes — fin", page)
             break
+
+        page_urls = {cat["url"] for cat in page_catalogues}
+        if page_urls and page_urls == prev_page_urls:
+            log.info("Page %d : contenu identique à la page précédente "
+                      "(pagination clampée par le site) — fin réelle du catalogue", page)
+            break
+        prev_page_urls = page_urls
 
         new_count = 0
         for cat in page_catalogues:
