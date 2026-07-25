@@ -94,28 +94,45 @@ async def fetch_json_api(url: str, *, retry: int = 3) -> dict | None:
       2. AniSkip/Jikan n'ont pas de protection Cloudflare, pas besoin de scraper
       3. On veut du JSON parse, pas du HTML string
 
+    Beta 1.3 : `timeout=15` passé à urlopen() est un timeout SOCKET, pas un
+    vrai timeout asyncio — observé en prod : le script restait bloqué
+    plusieurs MINUTES sur un seul épisode (probablement throttling silencieux
+    d'AniSkip, ou DNS qui traîne, cas où urllib ne respecte pas fidèlement le
+    timeout socket dans un thread). On enveloppe l'appel dans
+    asyncio.wait_for() avec un timeout dur — si ça dépasse HARD_TIMEOUT peu
+    importe ce qui se passe en dessous, on coupe et on retry normalement.
+
     Returns: dict parsé ou None si erreur.
     """
+    HARD_TIMEOUT = 20  # secondes, > le timeout socket (15s) pour lui laisser une chance d'abord
+
+    def _do_request():
+        req = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        })
+        resp = urllib.request.urlopen(req, timeout=15)
+        return resp.read()
+
     for attempt in range(retry):
         try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "application/json",
-            })
-            resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
-            raw = await asyncio.to_thread(resp.read)
+            raw = await asyncio.wait_for(asyncio.to_thread(_do_request), timeout=HARD_TIMEOUT)
             return json.loads(raw.decode("utf-8"))
+        except asyncio.TimeoutError:
+            wait = 2 ** attempt + random.uniform(0, 1)
+            log.debug("Timeout dur (%ds) sur %s — retry dans %.1fs", HARD_TIMEOUT, url, wait)
+            await asyncio.sleep(wait)
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504):
                 wait = 2 ** attempt + random.uniform(0, 1)
-                log.warning("HTTP %d sur %s — retry dans %.1fs", e.code, url, wait)
+                log.debug("HTTP %d sur %s — retry dans %.1fs", e.code, url, wait)
                 await asyncio.sleep(wait)
                 continue
-            log.warning("HTTP %d sur %s: %s", e.code, url, e.reason)
+            log.debug("HTTP %d sur %s: %s", e.code, url, e.reason)
             return None
         except Exception as e:
             wait = 2 ** attempt + random.uniform(0, 1)
-            log.warning("Erreur réseau sur %s: %s — retry dans %.1fs", url, e, wait)
+            log.debug("Erreur réseau sur %s: %s — retry dans %.1fs", url, e, wait)
             await asyncio.sleep(wait)
     return None
 
@@ -367,14 +384,14 @@ class ScraperClient:
                     self.req_count += 1
                     if resp.status_code in (429, 500, 502, 503, 504):
                         wait = 2 ** attempt + random.uniform(0, 1)
-                        log.warning("HTTP %d sur %s — retry dans %.1fs", resp.status_code, url, wait)
+                        log.debug("HTTP %d sur %s — retry dans %.1fs", resp.status_code, url, wait)
                         await asyncio.sleep(wait)
                         continue
                     title_match = re.search(r"<title>([^<]+)</title>", resp.text, re.IGNORECASE)
                     title = title_match.group(1).lower() if title_match else ""
                     if "blocked" in title or "attention required" in title:
                         wait = 5 + attempt * 5
-                        log.warning("Cloudflare block sur %s — retry dans %ds", url, wait)
+                        log.debug("Cloudflare block sur %s — retry dans %ds", url, wait)
                         await asyncio.sleep(wait)
                         continue
                     text = resp.text
@@ -389,9 +406,9 @@ class ScraperClient:
                     return text
                 except Exception as e:
                     wait = 2 ** attempt + random.uniform(0, 1)
-                    log.warning("Erreur réseau sur %s: %s — retry dans %.1fs", url, e, wait)
+                    log.debug("Erreur réseau sur %s: %s — retry dans %.1fs", url, e, wait)
                     await asyncio.sleep(wait)
-            log.error("Échec définitif après %d retries : %s", retry, url)
+            log.warning("Échec définitif après %d retries : %s", retry, url)
             return ""
 
     def close(self):
@@ -564,32 +581,38 @@ async def fetch_all_catalogues(
     prev_page_urls: set[str] | None = None
     HARD_PAGE_CAP = 3000
 
+    # Beta 1.4 : plus de log.info par page (pouvait générer des centaines de
+    # lignes à lui seul) — une seule barre tqdm indéterminée (pas de total
+    # connu à l'avance) avec le compteur courant en postfix.
+    cat_pbar = tqdm(desc="Catalogue", unit="page", dynamic_ncols=True,
+                     bar_format="{desc} |{bar}| page {n_fmt} [{rate_fmt}] {elapsed} | {postfix}")
+
     while True:
         if max_animes and len(all_catalogues) >= max_animes:
             break
         if page > HARD_PAGE_CAP:
-            log.error("Page %d : garde-fou HARD_PAGE_CAP=%d atteint — arrêt forcé "
+            log.warning("Page %d : garde-fou HARD_PAGE_CAP=%d atteint — arrêt forcé "
                        "(pagination probablement cassée côté site)", page, HARD_PAGE_CAP)
             break
         html = await client.get(f"{site_url}catalogue/?page={page}")
         if not html:
-            log.error("Page %d : erreur — arrêt", page)
+            log.debug("Page %d : erreur — arrêt", page)
             break
 
         soup = BeautifulSoup(html, "lxml")
         empty_marker = soup.find("p", class_="text-white font-bold text-2xl h-96 p-5")
         if empty_marker:
-            log.info("Page %d : page vide — fin du catalogue", page)
+            log.debug("Page %d : page vide — fin du catalogue", page)
             break
 
         page_catalogues = parse_catalogue_page(html, site_url)
         if not page_catalogues:
-            log.info("Page %d : 0 animes — fin", page)
+            log.debug("Page %d : 0 animes — fin", page)
             break
 
         page_urls = {cat["url"] for cat in page_catalogues}
         if page_urls and page_urls == prev_page_urls:
-            log.info("Page %d : contenu identique à la page précédente "
+            log.debug("Page %d : contenu identique à la page précédente "
                       "(pagination clampée par le site) — fin réelle du catalogue", page)
             break
         prev_page_urls = page_urls
@@ -605,13 +628,15 @@ async def fetch_all_catalogues(
                 all_catalogues.append(cat)
                 new_count += 1
 
-        log.info("Page %d : %d nouveaux (%d total, %d scans filtrés)", page, new_count, len(all_catalogues), scans_filtered)
+        cat_pbar.update(1)
+        cat_pbar.set_postfix_str(f"{len(all_catalogues)} animes, {scans_filtered} scans filtrés")
+        log.debug("Page %d : %d nouveaux (%d total, %d scans filtrés)", page, new_count, len(all_catalogues), scans_filtered)
 
         # Beta 1.1 : si name_filter fourni, check les matchs et break si au moins 1
         if nf_lower:
             matches = [c for c in all_catalogues if nf_lower in c["name"].lower()]
             if matches:
-                log.info("  → %d anime(s) matchent '%s' — arrêt du scan catalogue",
+                log.debug("  → %d anime(s) matchent '%s' — arrêt du scan catalogue",
                          len(matches), name_filter)
                 # On ne garde QUE les matchs
                 all_catalogues = matches
@@ -619,6 +644,7 @@ async def fetch_all_catalogues(
 
         page += 1
 
+    cat_pbar.close()
     if max_animes:
         all_catalogues = all_catalogues[:max_animes]
     log.info("Catalogue : %d animes (%d scans filtrés)", len(all_catalogues), scans_filtered)
@@ -1193,14 +1219,14 @@ async def fetch_mal_id_via_anilist(title: str) -> int | None:
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504):
                 wait = 2 ** attempt + random.uniform(0, 1)
-                log.warning("HTTP %d sur AniList — retry dans %.1fs", e.code, wait)
+                log.debug("HTTP %d sur AniList — retry dans %.1fs", e.code, wait)
                 await asyncio.sleep(wait)
                 continue
-            log.warning("HTTP %d sur AniList: %s", e.code, e.reason)
+            log.debug("HTTP %d sur AniList: %s", e.code, e.reason)
             return None
         except Exception as e:
             wait = 2 ** attempt + random.uniform(0, 1)
-            log.warning("Erreur réseau sur AniList: %s — retry dans %.1fs", e, wait)
+            log.debug("Erreur réseau sur AniList: %s — retry dans %.1fs", e, wait)
             await asyncio.sleep(wait)
     return None
 
@@ -1352,6 +1378,7 @@ async def enrich_with_skip_times(
         "mal_not_found": 0,
         "skip_found": 0,
         "skip_already_cached": 0,
+        "skip_early_abandoned": 0,
         "animes_processed": 0,
     }
 
@@ -1372,6 +1399,18 @@ async def enrich_with_skip_times(
         # 1. AniList (primaire) + Jikan (fallback) — récupérer mal_id si pas déjà cached
         mal_id = state_entry.get("mal_id")
         already_fetched = state_entry.get("mal_id_fetched", False)
+        mal_fetched_at = state_entry.get("mal_id_fetched_at", 0)
+
+        # Beta 1.3 : sans ça, un anime dont le mal_id n'était PAS trouvable au
+        # moment du fetch (titre mal résolu, hoquet temporaire AniList/Jikan)
+        # restait bloqué À VIE (already_fetched=True, mal_id=None) — plus
+        # jamais retenté automatiquement, donc plus jamais de skip_times pour
+        # AUCUN de ses épisodes (même futurs), sauf --force-refresh-mal manuel.
+        # On retente automatiquement après un délai raisonnable.
+        MAL_NOT_FOUND_RETRY_DAYS = 14
+        if (already_fetched and not mal_id
+                and (time.time() - mal_fetched_at) > MAL_NOT_FOUND_RETRY_DAYS * 86400):
+            already_fetched = False
 
         if not mal_id and not already_fetched:
             pbar.set_postfix_str(f"AniList: {short}")
@@ -1380,17 +1419,21 @@ async def enrich_with_skip_times(
 
             state_entry["mal_id"] = mal_id
             state_entry["mal_id_fetched"] = True
+            state_entry["mal_id_fetched_at"] = int(time.time())
             state_entry["mal_source"] = source  # 'anilist' | 'jikan' | 'none'
             state["animes_scraped"][source_url] = state_entry
 
             if mal_id:
                 stats["mal_found"] += 1
-                log.info("  ✓ %s: %s → mal_id=%d", source.upper(), short, mal_id)
+                pbar.set_postfix_str(f"{short} → mal_id={mal_id} ({source})")
+                log.debug("  ✓ %s: %s → mal_id=%d", source.upper(), short, mal_id)
                 c.execute("UPDATE anime SET mal_id=?, mal_id_fetched=1 WHERE anime_id=?",
                           (mal_id, anime_id))
             else:
                 stats["mal_not_found"] += 1
-                log.warning("  ✗ AniList+Jikan: %s → mal_id non trouvé", short)
+                pbar.set_postfix_str(f"{short} → mal_id introuvable")
+                log.debug("  ✗ AniList+Jikan: %s → mal_id non trouvé (retry dans %dj)",
+                            short, MAL_NOT_FOUND_RETRY_DAYS)
                 c.execute("UPDATE anime SET mal_id_fetched=1 WHERE anime_id=?", (anime_id,))
             conn.commit()
         elif mal_id:
@@ -1407,7 +1450,22 @@ async def enrich_with_skip_times(
             continue
 
         # 2. AniSkip — pour chaque épisode, fetch si pas en DB
+        # Beta 1.3 : court-circuit si un anime n'est visiblement pas couvert
+        # par AniSkip. Observé en prod : des animes comme Chihayafuru
+        # (mal_id trouvé, mais absent de la base communautaire AniSkip)
+        # renvoient 404 sur TOUS leurs épisodes — sans ce court-circuit, le
+        # script query quand même chacun des 20-25 épisodes un par un avant
+        # de conclure, ce qui explosait l'ETA (4h30+ observées).
+        # Seuil à 3 échecs CONSÉCUTIFS parmi les épisodes réellement queryés
+        # (pas ceux déjà en cache) avant d'abandonner le reste de l'anime.
+        # On ne cache PAS les épisodes ignorés sans requête : un run futur
+        # (si AniSkip ajoute la donnée un jour) les retentera normalement.
+        consecutive_misses = 0
+        ANISKIP_MISS_THRESHOLD = 3
+        anime_skipped_early = False
         for season in anime.get("seasons", []) or []:
+            if anime_skipped_early:
+                break
             season_number = season.get("season_number", 0)
             for episode in season.get("episodes", []) or []:
                 ep_num = episode.get("episode_number", 0)
@@ -1423,17 +1481,31 @@ async def enrich_with_skip_times(
                     stats["skip_already_cached"] += 1
                     continue
 
-                pbar.set_postfix_str(f"{short} E{ep_num}")
+                if consecutive_misses >= ANISKIP_MISS_THRESHOLD:
+                    anime_skipped_early = True
+                    stats["skip_early_abandoned"] = stats.get("skip_early_abandoned", 0) + 1
+                    pbar.set_postfix_str(f"{short} → non couvert AniSkip, abandon")
+                    log.debug("  ⏭ %s : %d échecs AniSkip consécutifs — anime probablement "
+                             "non couvert, on abandonne le reste (économie de requêtes)",
+                             short, ANISKIP_MISS_THRESHOLD)
+                    break
+
                 skip = await fetch_skip_times_via_aniskip(client, mal_id, ep_num)
                 stats["aniskip_queries"] += 1
                 await asyncio.sleep(ANISKIP_DELAY)
 
-                if skip and any(v is not None for v in skip.values()):
+                found = bool(skip and any(v is not None for v in skip.values()))
+                if found:
                     stats["skip_found"] += 1
-                    log.info("  ✓ AniSkip: %s E%d intro=%s-%s outro=%s-%s",
+                    consecutive_misses = 0
+                    pbar.set_postfix_str(f"{short} E{ep_num} → 200 trouvé")
+                    log.debug("  ✓ AniSkip: %s E%d intro=%s-%s outro=%s-%s",
                              short, ep_num,
                              skip["intro_start"], skip["intro_end"],
                              skip["outro_start"], skip["outro_end"])
+                else:
+                    consecutive_misses += 1
+                    pbar.set_postfix_str(f"{short} E{ep_num} → 404")
 
                 # INSERT même si skip=None → marque l'épisode comme "déjà query"
                 # pour pas le re-fetch au prochain run
@@ -1466,6 +1538,7 @@ async def enrich_with_skip_times(
              stats["mal_already_cached"], stats["mal_not_found"])
     log.info("  AniSkip queries : %d (skip trouvés: %d, déjà cached: %d)",
              stats["aniskip_queries"], stats["skip_found"], stats["skip_already_cached"])
+    log.info("  Animes abandonnés tôt (non couverts AniSkip) : %d", stats["skip_early_abandoned"])
     return stats
 
 
@@ -1520,7 +1593,79 @@ def merge_skip_times_into_animes(db_path: str, animes_out: list[dict]) -> int:
 args_state_path = None
 
 
-async def run_scraper(args):
+def push_to_hf(hf_api, hf_repo: str, args, label: str = ""):
+    """
+    Beta 1.3 : push DB + state + manifest sur HF.
+
+    Extrait de main() pour pouvoir être appelé à PLUSIEURS moments dans
+    run_scraper : une fois juste après le scraping (avant l'enrichissement
+    AniSkip qui peut prendre des heures), et une fois à la toute fin. Comme
+    ça, si la phase d'enrichissement crash, timeout, ou si le job CI se fait
+    tuer (limite 6h, annulation manuelle, OOM...), le scrape lui-même
+    (souvent le plus long/coûteux en requêtes HTTP) n'est jamais perdu — il
+    est déjà sur HF avant même que l'enrichissement démarre.
+
+    label: préfixe affiché dans les logs (ex: "scrape" ou "final") pour
+    distinguer les deux pushs dans les logs CI.
+    """
+    if not (hf_api and hf_repo and getattr(args, "push", False)):
+        return
+    prefix = f"[{label}] " if label else ""
+    log.info("%sPush des resultats sur HF ...", prefix)
+    if os.path.exists(args.db):
+        hf_api.upload_file(path_or_fileobj=args.db, path_in_repo="animezone.db", repo_id=hf_repo, repo_type="dataset")
+        log.info("%s✓ animezone.db pousse", prefix)
+    if os.path.exists(args.state):
+        hf_api.upload_file(path_or_fileobj=args.state, path_in_repo="state.json", repo_id=hf_repo, repo_type="dataset")
+        log.info("%s✓ state.json pousse", prefix)
+    # Generer et pousser le manifest
+    import sqlite3, time
+    if os.path.exists(args.db):
+        conn = sqlite3.connect(args.db)
+        c = conn.cursor()
+        # V2.15 : calcul du SHA256 de la DB pour vérification d'intégrité côté app
+        import hashlib as _hl
+        sha256 = _hl.sha256()
+        with open(args.db, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        manifest = {
+            "db_version": int(time.time()),
+            "last_update": int(time.time()),
+            "schema_version": 2,  # Beta 1.1 : schema v2 (avec skip_times + mal_id)
+            "total_animes": c.execute("SELECT COUNT(*) FROM anime").fetchone()[0],
+            "total_episodes": c.execute("SELECT COUNT(*) FROM episode").fetchone()[0],
+            "total_urls": c.execute("SELECT COUNT(*) FROM episode_url").fetchone()[0],
+            "db_sha256": sha256.hexdigest(),
+        }
+        # Beta 1.1 : stats enrichissement AniSkip
+        try:
+            manifest["animes_with_mal_id"] = c.execute(
+                "SELECT COUNT(*) FROM anime WHERE mal_id IS NOT NULL"
+            ).fetchone()[0]
+            manifest["skip_times_count"] = c.execute(
+                "SELECT COUNT(*) FROM skip_times"
+            ).fetchone()[0]
+            manifest["skip_times_with_intro"] = c.execute(
+                "SELECT COUNT(*) FROM skip_times WHERE intro_start IS NOT NULL"
+            ).fetchone()[0]
+            manifest["skip_times_with_outro"] = c.execute(
+                "SELECT COUNT(*) FROM skip_times WHERE outro_start IS NOT NULL"
+            ).fetchone()[0]
+        except Exception as e:
+            log.warning("Stats skip_times non disponibles: %s", e)
+            manifest["animes_with_mal_id"] = 0
+            manifest["skip_times_count"] = 0
+        conn.close()
+        with open("/tmp/manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+        hf_api.upload_file(path_or_fileobj="/tmp/manifest.json", path_in_repo="manifest.json", repo_id=hf_repo, repo_type="dataset")
+        log.info("%s✓ manifest.json pousse: %d animes, %d eps, %d skip_times, sha256=%s...",
+                 prefix, manifest["total_animes"], manifest["total_episodes"],
+                 manifest.get("skip_times_count", 0), manifest["db_sha256"][:16])
+
+
+async def run_scraper(args, hf_api=None, hf_repo: str = ""):
     state_path = args.state
     db_path = args.db
     json_path = args.json
@@ -1550,6 +1695,7 @@ async def run_scraper(args):
         write_db(db_path, animes_out)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({"anime": animes_out}, f, ensure_ascii=False, indent=2)
+        push_to_hf(hf_api, hf_repo, args, label="no-scrap")
         return
 
     client = ScraperClient()
@@ -1636,8 +1782,8 @@ async def run_scraper(args):
                     if new_seasons > old_seasons:
                         changes.append(f"+{new_seasons - old_seasons} saison(s)")
                     if changes:
-                        for change in changes:
-                            log.info("  → %s", change)
+                        pbar.set_postfix_str(f"{short_name}: {', '.join(changes)}")
+                        log.debug("  → %s", ", ".join(changes))
                         updated_count += 1
                     else:
                         unchanged_count += 1
@@ -1648,7 +1794,8 @@ async def run_scraper(args):
                 if idx % 10 == 0:
                     save_state(state_path, state)
             except Exception as e:
-                log.error("  ✗ Erreur scrape %s : %s", url, e)
+                pbar.set_postfix_str(f"{short_name}: ERREUR {e}")
+                log.debug("  ✗ Erreur scrape %s : %s", url, e)
         pbar.close()
 
         state["catalogue_seen_urls"] = [c["url"] for c in all_catalogues]
@@ -1658,6 +1805,15 @@ async def run_scraper(args):
 
         log.info("Écriture de la DB %s ...", db_path)
         write_db(db_path, animes_out)
+
+        # Beta 1.3 : push checkpoint AVANT l'enrichissement. Le scraping du
+        # catalogue peut prendre des dizaines de minutes (requêtes HTTP sur
+        # anime-sama.to) ; l'enrichissement AniSkip qui suit peut prendre des
+        # HEURES et est plus fragile (API tierces, throttling, timeouts...).
+        # Sans ce push intermédiaire, un crash/timeout/annulation pendant
+        # l'enrichissement faisait perdre TOUT le travail de scraping, jamais
+        # poussé sur HF puisque le seul push avait lieu à la toute fin.
+        push_to_hf(hf_api, hf_repo, args, label="scrape")
 
         # Beta 1.1 : phase d'enrichissement AniSkip (skip intro/outro).
         # On construit le mapping anime_id → source_url pour pouvoir retrouver
@@ -1699,6 +1855,9 @@ async def run_scraper(args):
 
         # Save state final (avec tous les mal_id cached)
         save_state(state_path, state)
+
+        # Beta 1.3 : push final, avec les skip_times fusionnés cette fois.
+        push_to_hf(hf_api, hf_repo, args, label="final")
 
         log.info(
             "\n✅ Scrap terminé\n"
@@ -1745,8 +1904,19 @@ def main():
     parser.add_argument("--repo", default="animezone-catalog", help="Nom du repo HF")
     parser.add_argument("--push", action="store_true", help="Push DB + state sur HF a la fin")
     parser.add_argument("--pull", action="store_true", help="Pull state depuis HF au debut")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Beta 1.4 : réactive les logs détaillés par item "
+                             "(par épisode/anime/page/retry HTTP) — désactivés "
+                             "par défaut pour éviter de spammer le terminal "
+                             "(observé : 15000+ lignes sur un run complet). "
+                             "Par défaut, seuls les résumés de phase + les 2 "
+                             "barres tqdm (scrape, AniSkip) sont affichés.")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        log.setLevel(logging.DEBUG)
+        log.debug("Mode verbose actif : logs détaillés par item réactivés")
 
     # Setup HF si token fourni
     hf_api = None
@@ -1788,62 +1958,11 @@ def main():
         except Exception:
             log.info("Pas de %s sur HF — demarrage from scratch (1er run)", os.path.basename(args.db))
 
-    asyncio.run(run_scraper(args))
+    asyncio.run(run_scraper(args, hf_api=hf_api, hf_repo=hf_repo))
 
-    # Push vers HF si demandé
-    if args.push and hf_api:
-        log.info("Push des resultats sur HF ...")
-        if os.path.exists(args.db):
-            hf_api.upload_file(path_or_fileobj=args.db, path_in_repo="animezone.db", repo_id=hf_repo, repo_type="dataset")
-            log.info("✓ animezone.db pousse")
-        if os.path.exists(args.state):
-            hf_api.upload_file(path_or_fileobj=args.state, path_in_repo="state.json", repo_id=hf_repo, repo_type="dataset")
-            log.info("✓ state.json pousse")
-        # Generer et pousser le manifest
-        import sqlite3, time
-        if os.path.exists(args.db):
-            conn = sqlite3.connect(args.db)
-            c = conn.cursor()
-            # V2.15 : calcul du SHA256 de la DB pour vérification d'intégrité côté app
-            import hashlib as _hl
-            sha256 = _hl.sha256()
-            with open(args.db, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    sha256.update(chunk)
-            manifest = {
-                "db_version": int(time.time()),
-                "last_update": int(time.time()),
-                "schema_version": 2,  # Beta 1.1 : schema v2 (avec skip_times + mal_id)
-                "total_animes": c.execute("SELECT COUNT(*) FROM anime").fetchone()[0],
-                "total_episodes": c.execute("SELECT COUNT(*) FROM episode").fetchone()[0],
-                "total_urls": c.execute("SELECT COUNT(*) FROM episode_url").fetchone()[0],
-                "db_sha256": sha256.hexdigest(),
-            }
-            # Beta 1.1 : stats enrichissement AniSkip
-            try:
-                manifest["animes_with_mal_id"] = c.execute(
-                    "SELECT COUNT(*) FROM anime WHERE mal_id IS NOT NULL"
-                ).fetchone()[0]
-                manifest["skip_times_count"] = c.execute(
-                    "SELECT COUNT(*) FROM skip_times"
-                ).fetchone()[0]
-                manifest["skip_times_with_intro"] = c.execute(
-                    "SELECT COUNT(*) FROM skip_times WHERE intro_start IS NOT NULL"
-                ).fetchone()[0]
-                manifest["skip_times_with_outro"] = c.execute(
-                    "SELECT COUNT(*) FROM skip_times WHERE outro_start IS NOT NULL"
-                ).fetchone()[0]
-            except Exception as e:
-                log.warning("Stats skip_times non disponibles: %s", e)
-                manifest["animes_with_mal_id"] = 0
-                manifest["skip_times_count"] = 0
-            conn.close()
-            with open("/tmp/manifest.json", "w") as f:
-                json.dump(manifest, f, indent=2)
-            hf_api.upload_file(path_or_fileobj="/tmp/manifest.json", path_in_repo="manifest.json", repo_id=hf_repo, repo_type="dataset")
-            log.info("✓ manifest.json pousse: %d animes, %d eps, %d skip_times, sha256=%s...",
-                     manifest["total_animes"], manifest["total_episodes"],
-                     manifest.get("skip_times_count", 0), manifest["db_sha256"][:16])
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
