@@ -218,11 +218,11 @@ CREATE TABLE IF NOT EXISTS skip_times (
     outro_start     REAL,
     outro_end       REAL,
     fetched_at      INTEGER NOT NULL,
-    UNIQUE (mal_id, episode_number),
+    UNIQUE (mal_id, season_number, episode_number),
     FOREIGN KEY (anime_id) REFERENCES anime(anime_id)
 );
 CREATE INDEX IF NOT EXISTS idx_skip_times_anime  ON skip_times(anime_id);
-CREATE INDEX IF NOT EXISTS idx_skip_times_lookup ON skip_times(mal_id, episode_number);
+CREATE INDEX IF NOT EXISTS idx_skip_times_lookup ON skip_times(mal_id, season_number, episode_number);
 """
 
 USER_AGENT = (
@@ -923,12 +923,56 @@ def write_db(db_path: str, animes: list[dict]):
                 outro_start     REAL,
                 outro_end       REAL,
                 fetched_at      INTEGER NOT NULL,
-                UNIQUE (mal_id, episode_number),
+                UNIQUE (mal_id, season_number, episode_number),
                 FOREIGN KEY (anime_id) REFERENCES anime(anime_id)
             );
             CREATE INDEX IF NOT EXISTS idx_skip_times_anime  ON skip_times(anime_id);
-            CREATE INDEX IF NOT EXISTS idx_skip_times_lookup ON skip_times(mal_id, episode_number);
+            CREATE INDEX IF NOT EXISTS idx_skip_times_lookup ON skip_times(mal_id, season_number, episode_number);
         """)
+
+        # Beta 1.2 : migration — les DB générées avant ce correctif ont une
+        # contrainte UNIQUE(mal_id, episode_number) qui ne tient PAS compte de
+        # season_number. Résultat : pour un anime multi-saisons (ep_num qui
+        # repart à 1 à chaque saison), seule la 1ère saison gardait ses skip
+        # times, les suivantes étaient écrasées ou skippées comme "déjà en cache".
+        # On détecte l'ancien schéma via sqlite_master et on migre sans perdre
+        # les données déjà récupérées (coûteuses en requêtes AniSkip).
+        try:
+            table_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='skip_times'"
+            ).fetchone()
+            if table_sql and "UNIQUE (mal_id, episode_number)" in (table_sql[0] or ""):
+                log.info("  → Migration skip_times : ancienne contrainte UNIQUE détectée, réparation...")
+                conn.executescript("""
+                    ALTER TABLE skip_times RENAME TO skip_times_old;
+                    CREATE TABLE skip_times (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        anime_id        INTEGER NOT NULL,
+                        mal_id          INTEGER NOT NULL,
+                        season_number   INTEGER NOT NULL,
+                        episode_number  INTEGER NOT NULL,
+                        intro_start     REAL,
+                        intro_end       REAL,
+                        outro_start     REAL,
+                        outro_end       REAL,
+                        fetched_at      INTEGER NOT NULL,
+                        UNIQUE (mal_id, season_number, episode_number),
+                        FOREIGN KEY (anime_id) REFERENCES anime(anime_id)
+                    );
+                    INSERT OR IGNORE INTO skip_times
+                        (anime_id, mal_id, season_number, episode_number,
+                         intro_start, intro_end, outro_start, outro_end, fetched_at)
+                    SELECT anime_id, mal_id, season_number, episode_number,
+                           intro_start, intro_end, outro_start, outro_end, fetched_at
+                    FROM skip_times_old;
+                    DROP TABLE skip_times_old;
+                    CREATE INDEX IF NOT EXISTS idx_skip_times_anime  ON skip_times(anime_id);
+                    CREATE INDEX IF NOT EXISTS idx_skip_times_lookup ON skip_times(mal_id, season_number, episode_number);
+                """)
+                conn.commit()
+                log.info("  ✓ Migration skip_times terminée")
+        except Exception as e:
+            log.warning("Migration skip_times échouée (non bloquant) : %s", e)
     c = conn.cursor()
     # V2.15 : on vide toutes les tables avant de re-remplir pour éviter les
     # restes d'anciens IDs. Comme les IDs sont désormais stables, le INSERT OR
@@ -939,9 +983,18 @@ def write_db(db_path: str, animes: list[dict]):
     # ré-associés aux animes/épisodes via mal_id (clé stable, indépendante de
     # l'anime_id). Les orphelins (animes supprimés du catalogue) restent mais
     # sont inoffensifs — un cleanup périodique peut les virer si besoin.
+    # Beta 1.2 : DELETE puis réinsertion dans LA MÊME transaction (un seul
+    # commit final). Avant, un commit() intermédiaire validait le DELETE FROM
+    # anime pendant que la table était encore vide — si skip_times (FK ON
+    # anime_id) contenait déjà des lignes, ça cassait avec IntegrityError dès
+    # ce premier commit, peu importe defer_foreign_keys. En ne committant
+    # qu'une fois que anime est repeuplée, la FK est satisfaite au moment du
+    # commit et defer_foreign_keys n'est même plus strictement nécessaire —
+    # on le garde par sécurité au cas où l'ordre de _upsert_anime laisserait
+    # transitoirement des enfants orphelins.
+    conn.execute("PRAGMA defer_foreign_keys=ON;")
     for table in ["episode_url", "episode", "season", "anime_genre", "anime", "genre", "discover"]:
         c.execute(f"DELETE FROM {table}")
-    conn.commit()
 
     for anime in animes:
         _upsert_anime(c, anime)
@@ -1333,10 +1386,12 @@ async def enrich_with_skip_times(
             for episode in season.get("episodes", []) or []:
                 ep_num = episode.get("episode_number", 0)
 
-                # Check cache DB
+                # Check cache DB (mal_id + season_number + episode_number : un
+                # même mal_id peut couvrir plusieurs saisons dont les numéros
+                # d'épisode repartent à 1 à chaque saison)
                 existing = c.execute(
-                    "SELECT 1 FROM skip_times WHERE mal_id=? AND episode_number=? LIMIT 1",
-                    (mal_id, ep_num)
+                    "SELECT 1 FROM skip_times WHERE mal_id=? AND season_number=? AND episode_number=? LIMIT 1",
+                    (mal_id, season_number, ep_num)
                 ).fetchone()
                 if existing:
                     stats["skip_already_cached"] += 1
@@ -1386,6 +1441,52 @@ async def enrich_with_skip_times(
     log.info("  AniSkip queries : %d (skip trouvés: %d, déjà cached: %d)",
              stats["aniskip_queries"], stats["skip_found"], stats["skip_already_cached"])
     return stats
+
+
+def merge_skip_times_into_animes(db_path: str, animes_out: list[dict]) -> int:
+    """
+    Beta 1.2 : relit la table `skip_times` en DB et injecte un champ
+    "skip_times": {"intro_start":..,"intro_end":..,"outro_start":..,"outro_end":..}
+    dans chaque dict épisode de animes_out.
+
+    Sans ça, enrich_with_skip_times écrivait bien les temps dans la table SQL
+    `skip_times`, mais ni le JSON exporté ni la colonne `raw_json` de la table
+    `anime` ne les contenaient jamais (les dicts en mémoire n'étaient jamais
+    modifiés après le scrap classique).
+
+    Returns: nombre d'épisodes enrichis.
+    """
+    if not os.path.exists(db_path):
+        return 0
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT anime_id, season_number, episode_number, "
+        "intro_start, intro_end, outro_start, outro_end FROM skip_times"
+    ).fetchall()
+    conn.close()
+
+    # index: (anime_id, season_number, episode_number) -> skip dict
+    index: dict[tuple[int, int, int], dict] = {}
+    for anime_id, season_number, ep_num, i_start, i_end, o_start, o_end in rows:
+        if i_start is None and o_start is None:
+            continue  # rien trouvé pour cet épisode, on ne pollue pas le JSON
+        index[(anime_id, season_number, ep_num)] = {
+            "intro_start": i_start, "intro_end": i_end,
+            "outro_start": o_start, "outro_end": o_end,
+        }
+
+    enriched = 0
+    for anime in animes_out:
+        anime_id = anime.get("anime_id")
+        for season in anime.get("seasons", []) or []:
+            season_number = season.get("season_number", 0)
+            for episode in season.get("episodes", []) or []:
+                key = (anime_id, season_number, episode.get("episode_number", 0))
+                skip = index.get(key)
+                if skip:
+                    episode["skip_times"] = skip
+                    enriched += 1
+    return enriched
 
 
 # Variable globale sale pour permettre à enrich_with_skip_times de save_state
@@ -1531,9 +1632,6 @@ async def run_scraper(args):
 
         log.info("Écriture de la DB %s ...", db_path)
         write_db(db_path, animes_out)
-        log.info("Écriture du JSON %s ...", json_path)
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump({"anime": animes_out}, f, ensure_ascii=False, indent=2)
 
         # Beta 1.1 : phase d'enrichissement AniSkip (skip intro/outro).
         # On construit le mapping anime_id → source_url pour pouvoir retrouver
@@ -1558,6 +1656,20 @@ async def run_scraper(args):
                 )
             except Exception as e:
                 log.error("Phase enrich_with_skip_times échouée: %s", e)
+
+        # Beta 1.2 : fusionner les skip_times (récupérés dans la table SQL
+        # pendant enrich_with_skip_times) dans les dicts animes_out, PUIS
+        # réécrire la DB (pour que raw_json soit à jour) et le JSON.
+        # C'est ce qui manquait : avant, ni le JSON ni raw_json en DB
+        # n'avaient jamais les intro/outro, même quand la table skip_times
+        # les contenait.
+        n_enriched = merge_skip_times_into_animes(db_path, animes_out)
+        log.info("  → %d épisode(s) enrichi(s) avec intro/outro", n_enriched)
+        write_db(db_path, animes_out)
+
+        log.info("Écriture du JSON %s ...", json_path)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump({"anime": animes_out}, f, ensure_ascii=False, indent=2)
 
         # Save state final (avec tous les mal_id cached)
         save_state(state_path, state)
@@ -1627,14 +1739,28 @@ def main():
 
     # Pull state depuis HF si demandé
     if args.pull and hf_api:
+        import shutil
         try:
             log.info("Telechargement state.json depuis HF ...")
             path = hf_hub_download(repo_id=hf_repo, filename="state.json", repo_type="dataset", token=args.hf)
-            import shutil
             shutil.copy(path, args.state)
             log.info("✓ state.json recupere")
         except Exception:
             log.info("Pas de state.json sur HF — demarrage from scratch")
+
+        # Beta 1.2 : le state.json ne contient QUE le cache mal_id, pas le
+        # cache skip_times (qui vit uniquement dans animezone.db). Sur un
+        # runner CI éphémère (GitHub Actions), la DB locale n'existe jamais
+        # au démarrage → sans ce pull, toute la table skip_times repartait de
+        # zéro à CHAQUE run, et le script re-queryait AniSkip pour tous les
+        # épisodes de tous les animes toutes les 6h, indéfiniment.
+        try:
+            log.info("Telechargement %s depuis HF ...", os.path.basename(args.db))
+            path = hf_hub_download(repo_id=hf_repo, filename="animezone.db", repo_type="dataset", token=args.hf)
+            shutil.copy(path, args.db)
+            log.info("✓ %s recupere (cache skip_times/mal_id preserve)", os.path.basename(args.db))
+        except Exception:
+            log.info("Pas de %s sur HF — demarrage from scratch (1er run)", os.path.basename(args.db))
 
     asyncio.run(run_scraper(args))
 
