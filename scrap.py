@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """Scraper Anime-Sama (anime-sama.to) avec cloudscraper.
 
+Beta 1.1 — Enrichissement AniSkip (skip intro/outro)
+  - Après la phase de scrap classique, une nouvelle phase enrich_with_skip_times
+    récupère pour chaque anime :
+      1. Le MAL ID via l'API Jikan (cache dans state.json → déjà_use_api=true)
+      2. Les skip times (intro/outro) pour chaque épisode via l'API AniSkip
+  - Sur les runs suivants, le cache est utilisé :
+      - mal_id déjà connu → on NE RE-QUERY PAS Jikan (ton "already_use_api")
+      - skip_times déjà en DB → on NE RE-QUERY PAS AniSkip pour cet épisode
+  - Donc seuls les NOUVEAUX animes (Jikan) et NOUVEAUX épisodes (AniSkip)
+    déclenchent des requêtes API.
+
 V2.15 — Stable anime_id via hash MD5 de l'URL.
   - anime_id = int.from_bytes(md5(url).digest()[:4], 'big')
   - Avant : compteur séquentiel (next_anime_id) → IDs instables entre runs
@@ -29,6 +40,8 @@ import sqlite3
 import sys
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from ast import literal_eval
 from html import unescape
 from typing import Any
@@ -49,6 +62,63 @@ log = logging.getLogger("scrap")
 
 REQUEST_DELAY = 0.3
 
+# ==================================================================
+# Beta 1.1 — APIs externes pour l'enrichissement (skip intro/outro)
+# ==================================================================
+# Jikan : API publique non-officielle MyAnimeList (mapping titre → mal_id).
+# Limite officielle : 3 req/sec → on sleep 0.4s entre req pour être safe.
+# ⚠️ Jikan est souvent instable (504 fréquents). On l'utilise seulement comme
+# fallback si AniList (primaire) échoue.
+JIKAN_BASE = "https://api.jikan.moe/v4"
+JIKAN_DELAY = 0.4
+
+# AniList : API GraphQL publique, plus stable que Jikan. On l'utilise en PRIMAIRE.
+# Rate limit ~60 req/min (toléré), pas de clé API requise.
+# Renvoie idMal (MAL ID) directement → on peut brancher AniSkip.
+ANILIST_URL = "https://graphql.anilist.co"
+ANILIST_DELAY = 0.5  # 2 req/sec pour être safe (60/min max)
+
+# AniSkip : API communautaire de skip times (intro/outro) crowdsourceur.
+# Pas de hard limit, mais on est poli → 0.2s entre req (5 req/sec).
+ANISKIP_BASE = "https://api.aniskip.com/v2"
+ANISKIP_DELAY = 0.2
+
+
+async def fetch_json_api(url: str, *, retry: int = 3) -> dict | None:
+    """
+    Fetch JSON depuis une API publique (Jikan, AniSkip).
+
+    IMPORTANT : on NE passe PAS par ScraperClient.get() car :
+      1. cloudscraper est configuré pour HTML (headers navigateur, anti-bot)
+         et filtre les réponses < 100 chars → JSON courts Jikan seraient rejetés
+      2. AniSkip/Jikan n'ont pas de protection Cloudflare, pas besoin de scraper
+      3. On veut du JSON parse, pas du HTML string
+
+    Returns: dict parsé ou None si erreur.
+    """
+    for attempt in range(retry):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            })
+            resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
+            raw = await asyncio.to_thread(resp.read)
+            return json.loads(raw.decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504):
+                wait = 2 ** attempt + random.uniform(0, 1)
+                log.warning("HTTP %d sur %s — retry dans %.1fs", e.code, url, wait)
+                await asyncio.sleep(wait)
+                continue
+            log.warning("HTTP %d sur %s: %s", e.code, url, e.reason)
+            return None
+        except Exception as e:
+            wait = 2 ** attempt + random.uniform(0, 1)
+            log.warning("Erreur réseau sur %s: %s — retry dans %.1fs", url, e, wait)
+            await asyncio.sleep(wait)
+    return None
+
 SCHEMA = """
 CREATE TABLE anime (
     anime_id             INTEGER PRIMARY KEY,
@@ -66,7 +136,9 @@ CREATE TABLE anime (
     has_episodes         INTEGER DEFAULT 0,
     seasons_fetched      INTEGER DEFAULT 0,
     languages            TEXT,
-    raw_json             TEXT NOT NULL
+    raw_json             TEXT NOT NULL,
+    mal_id               INTEGER,
+    mal_id_fetched       INTEGER DEFAULT 0
 );
 CREATE TABLE genre (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +203,26 @@ CREATE INDEX idx_episode_season      ON episode(season_id);
 CREATE INDEX idx_episode_url_ep      ON episode_url(episode_id);
 CREATE INDEX idx_episode_url_host    ON episode_url(host);
 CREATE INDEX idx_episode_url_lang    ON episode_url(episode_id, language);
+
+-- Beta 1.1 : MAL ID pour brancher AniSkip (table anime)
+-- On les ajoute via ALTER TABLE dans write_db pour les DBs existantes.
+-- Pour une nouvelle DB, on les met directement ici.
+CREATE TABLE IF NOT EXISTS skip_times (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    anime_id        INTEGER NOT NULL,
+    mal_id          INTEGER NOT NULL,
+    season_number   INTEGER NOT NULL,
+    episode_number  INTEGER NOT NULL,
+    intro_start     REAL,
+    intro_end       REAL,
+    outro_start     REAL,
+    outro_end       REAL,
+    fetched_at      INTEGER NOT NULL,
+    UNIQUE (mal_id, episode_number),
+    FOREIGN KEY (anime_id) REFERENCES anime(anime_id)
+);
+CREATE INDEX IF NOT EXISTS idx_skip_times_anime  ON skip_times(anime_id);
+CREATE INDEX IF NOT EXISTS idx_skip_times_lookup ON skip_times(mal_id, episode_number);
 """
 
 USER_AGENT = (
@@ -445,13 +537,17 @@ def parse_catalogue_page(html: str, site_url: str) -> list[dict]:
 
 
 async def fetch_all_catalogues(
-    client: ScraperClient, site_url: str, max_animes: int | None = None
+    client: ScraperClient, site_url: str, max_animes: int | None = None,
+    name_filter: str | None = None,
 ) -> list[dict]:
     log.info("Récupération du catalogue complet depuis %scatalogue/ ...", site_url)
     all_catalogues: list[dict] = []
     seen_urls: set[str] = set()
     page = 1
     scans_filtered = 0
+    # Beta 1.1 : si name_filter fourni, on break dès qu'on a trouvé au moins 1 match.
+    # Évite de scanner les 279 pages du catalogue juste pour tester un anime.
+    nf_lower = name_filter.lower() if name_filter else None
 
     while True:
         if max_animes and len(all_catalogues) >= max_animes:
@@ -484,6 +580,17 @@ async def fetch_all_catalogues(
                 new_count += 1
 
         log.info("Page %d : %d nouveaux (%d total, %d scans filtrés)", page, new_count, len(all_catalogues), scans_filtered)
+
+        # Beta 1.1 : si name_filter fourni, check les matchs et break si au moins 1
+        if nf_lower:
+            matches = [c for c in all_catalogues if nf_lower in c["name"].lower()]
+            if matches:
+                log.info("  → %d anime(s) matchent '%s' — arrêt du scan catalogue",
+                         len(matches), name_filter)
+                # On ne garde QUE les matchs
+                all_catalogues = matches
+                break
+
         page += 1
 
     if max_animes:
@@ -790,10 +897,48 @@ def write_db(db_path: str, animes: list[dict]):
                 log.info("  → Colonne 'alternative_titles' ajoutée à la table anime")
         except Exception as e:
             log.warning("Migration alternative_titles: %s", e)
+
+        # Beta 1.1 : ajouter mal_id + mal_id_fetched sur anime si manquants
+        try:
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(anime)").fetchall()]
+            if "mal_id" not in cols:
+                conn.execute("ALTER TABLE anime ADD COLUMN mal_id INTEGER")
+                log.info("  → Colonne 'mal_id' ajoutée à la table anime")
+            if "mal_id_fetched" not in cols:
+                conn.execute("ALTER TABLE anime ADD COLUMN mal_id_fetched INTEGER DEFAULT 0")
+                log.info("  → Colonne 'mal_id_fetched' ajoutée à la table anime")
+        except Exception as e:
+            log.warning("Migration mal_id: %s", e)
+
+        # Beta 1.1 : créer la table skip_times si elle n'existe pas
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS skip_times (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                anime_id        INTEGER NOT NULL,
+                mal_id          INTEGER NOT NULL,
+                season_number   INTEGER NOT NULL,
+                episode_number  INTEGER NOT NULL,
+                intro_start     REAL,
+                intro_end       REAL,
+                outro_start     REAL,
+                outro_end       REAL,
+                fetched_at      INTEGER NOT NULL,
+                UNIQUE (mal_id, episode_number),
+                FOREIGN KEY (anime_id) REFERENCES anime(anime_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_skip_times_anime  ON skip_times(anime_id);
+            CREATE INDEX IF NOT EXISTS idx_skip_times_lookup ON skip_times(mal_id, episode_number);
+        """)
     c = conn.cursor()
     # V2.15 : on vide toutes les tables avant de re-remplir pour éviter les
     # restes d'anciens IDs. Comme les IDs sont désormais stables, le INSERT OR
     # REPLACE aurait suffit, mais un TRUNCATE est plus propre.
+    #
+    # Beta 1.1 : ⚠️ on NE DELETE PAS `skip_times` ! Sinon on perd tout le
+    # cache AniSkip à chaque run (15 000+ req à refaire). Les skip_times sont
+    # ré-associés aux animes/épisodes via mal_id (clé stable, indépendante de
+    # l'anime_id). Les orphelins (animes supprimés du catalogue) restent mais
+    # sont inoffensifs — un cleanup périodique peut les virer si besoin.
     for table in ["episode_url", "episode", "season", "anime_genre", "anime", "genre", "discover"]:
         c.execute(f"DELETE FROM {table}")
     conn.commit()
@@ -891,6 +1036,363 @@ def _upsert_anime(c, anime: dict):
                     """, (episode_id, lang, u, pos, h))
 
 
+# ==================================================================
+# Beta 1.1 — Enrichissement AniSkip (skip intro/outro)
+# ==================================================================
+
+def _clean_title_for_jikan(title: str) -> str:
+    """
+    Nettoie un titre d'anime pour la recherche Jikan.
+    - Retire "Saison X", "S X", "(TV)", etc.
+    - Retire les suffixes de version ("Kai", "Director's Cut", ...)
+    - Garde le titre principal
+    """
+    if not title:
+        return ""
+    t = title.strip()
+    # Retire "Saison X" / "S X" en fin de titre
+    t = re.sub(r"\s+(?:Saison|S)\s*\d+$", "", t, flags=re.IGNORECASE)
+    # Retire "(...)" à la fin
+    t = re.sub(r"\s*\([^)]*\)\s*$", "", t)
+    # Retire ": ..." à la fin
+    t = re.sub(r"\s*:\s*[^:]+$", "", t)
+    return t.strip()
+
+
+async def fetch_mal_id_via_anilist(title: str) -> int | None:
+    """
+    Récupère le MAL ID via l'API GraphQL AniList (primaire, plus stable que Jikan).
+
+    Query :
+        query($search: String) {
+            Page(perPage: 5) {
+                media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+                    idMal
+                    title { romaji english native }
+                }
+            }
+        }
+
+    Returns: mal_id (int) ou None si non trouvé / erreur réseau.
+    """
+    clean = _clean_title_for_jikan(title)
+    if not clean:
+        return None
+
+    query = """
+    query($search: String) {
+        Page(perPage: 5) {
+            media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
+                idMal
+                title { romaji english native }
+            }
+        }
+    }
+    """
+    payload = json.dumps({"query": query, "variables": {"search": clean}}).encode("utf-8")
+
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                ANILIST_URL,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": USER_AGENT,
+                },
+                method="POST",
+            )
+            resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
+            raw = await asyncio.to_thread(resp.read)
+            data = json.loads(raw.decode("utf-8"))
+            media_list = ((data.get("data") or {}).get("Page") or {}).get("media") or []
+            if not media_list:
+                return None
+            # Premier résultat = meilleur match (sort: SEARCH_MATCH)
+            return media_list[0].get("idMal")
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504):
+                wait = 2 ** attempt + random.uniform(0, 1)
+                log.warning("HTTP %d sur AniList — retry dans %.1fs", e.code, wait)
+                await asyncio.sleep(wait)
+                continue
+            log.warning("HTTP %d sur AniList: %s", e.code, e.reason)
+            return None
+        except Exception as e:
+            wait = 2 ** attempt + random.uniform(0, 1)
+            log.warning("Erreur réseau sur AniList: %s — retry dans %.1fs", e, wait)
+            await asyncio.sleep(wait)
+    return None
+
+
+async def fetch_mal_id_via_jikan(client: ScraperClient, title: str) -> int | None:
+    """
+    Fallback Jikan (utilisé seulement si AniList échoue).
+
+    Returns: mal_id (int) ou None si non trouvé / erreur réseau.
+    """
+    clean = _clean_title_for_jikan(title)
+    if not clean:
+        return None
+    from urllib.parse import quote
+    url = f"{JIKAN_BASE}/anime?q={quote(clean)}&limit=5&sfw=true"
+    data = await fetch_json_api(url)
+    if not data:
+        return None
+    animes = data.get("data") or []
+    if not animes:
+        return None
+    # Premier résultat = meilleur match (Jikan trie par pertinence)
+    return animes[0].get("mal_id")
+
+
+async def fetch_mal_id(client: ScraperClient, title: str) -> tuple[int | None, str]:
+    """
+    Récupère le MAL ID en essayant AniList d'abord, puis Jikan en fallback.
+
+    Returns: (mal_id, source) où source est 'anilist' | 'jikan' | 'none'
+    """
+    # 1. AniList (primaire)
+    mal_id = await fetch_mal_id_via_anilist(title)
+    await asyncio.sleep(ANILIST_DELAY)
+    if mal_id:
+        return mal_id, "anilist"
+
+    # 2. Jikan (fallback)
+    mal_id = await fetch_mal_id_via_jikan(client, title)
+    await asyncio.sleep(JIKAN_DELAY)
+    if mal_id:
+        return mal_id, "jikan"
+
+    return None, "none"
+
+
+async def fetch_skip_times_via_aniskip(
+    client: ScraperClient, mal_id: int, episode_number: int,
+    episode_length: int = 1440,
+) -> dict | None:
+    """
+    Récupère les skip times (intro + outro) pour un épisode via AniSkip API.
+
+    Args:
+        mal_id: MAL ID de l'anime
+        episode_number: numéro de l'épisode
+        episode_length: durée de l'épisode en secondes (défaut 1440 = 24 min).
+                       ⚠️ OBLIGATOIRE pour AniSkip — sans ça, HTTP 400.
+
+    Returns:
+      {"intro_start": float|None, "intro_end": float|None,
+       "outro_start": float|None, "outro_end": float|None}
+      ou None si l'API ne trouve pas l'épisode ou rate.
+
+    Format de réponse AniSkip (validé via test_api.py) :
+      {
+        "found": true,
+        "results": [
+          {
+            "interval": { "startTime": 54.7, "endTime": 145.1 },
+            "skipType": "op",       ← "op" = opening, "ed" = ending
+            "skipId": "...",
+            "episodeLength": 1435
+          },
+          ...
+        ]
+      }
+
+    ⚠️ startTime/endTime sont dans "interval", PAS au top-level.
+    """
+    url = (f"{ANISKIP_BASE}/skip-times/{mal_id}/{episode_number}"
+           f"?types[]=op&types[]=ed&episodeLength={episode_length}")
+    data = await fetch_json_api(url)
+    if not data:
+        return None
+    if not data.get("found"):
+        return None
+    results = data.get("results") or []
+    skip = {
+        "intro_start": None, "intro_end": None,
+        "outro_start": None, "outro_end": None,
+    }
+    for r in results:
+        skip_type = r.get("skipType", "")
+        interval = r.get("interval") or {}
+        try:
+            start = float(interval.get("startTime", 0))
+            end = float(interval.get("endTime", 0))
+        except (TypeError, ValueError):
+            continue
+        if skip_type == "op":
+            skip["intro_start"] = start
+            skip["intro_end"] = end
+        elif skip_type == "ed":
+            skip["outro_start"] = start
+            skip["outro_end"] = end
+    # Si rien trouvé, on renvoie quand même un dict (pour qu'on puisse marquer
+    # l'épisode comme "déjà query, pas de skip" dans la DB → pas de re-query)
+    return skip
+
+
+async def enrich_with_skip_times(
+    client: ScraperClient,
+    db_path: str,
+    state: dict,
+    animes_out: list[dict],
+    source_url_by_id: dict[int, str],
+) -> dict:
+    """
+    Phase d'enrichissement après write_db :
+      1. Pour chaque anime :
+         - Si state[url].mal_id est connu → SKIP Jikan (c'est ton "already_use_api")
+         - Sinon → query Jikan → cache mal_id dans state + UPDATE DB
+      2. Pour chaque épisode de l'anime :
+         - Si skip_times déjà en DB pour (mal_id, ep_num) → SKIP AniSkip
+         - Sinon → query AniSkip → INSERT dans skip_times
+
+    Args:
+        source_url_by_id: mapping {anime_id → source_url} pour retrouver
+                          l'entrée state. Construit par run_scraper.
+
+    Returns:
+        stats: {"jikan_queries", "aniskip_queries", "mal_found",
+                "skip_found", "animes_processed"}
+    """
+    log.info("\n" + "=" * 60)
+    log.info("=== Phase d'enrichissement AniSkip (skip intro/outro) ===")
+    log.info("=" * 60)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    c = conn.cursor()
+
+    stats = {
+        "jikan_queries": 0,
+        "aniskip_queries": 0,
+        "mal_found": 0,
+        "mal_already_cached": 0,
+        "mal_not_found": 0,
+        "skip_found": 0,
+        "skip_already_cached": 0,
+        "animes_processed": 0,
+    }
+
+    pbar = tqdm(animes_out, desc="AniSkip", unit="anime",
+                bar_format="{desc} {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt} [{rate_fmt}] ETA {remaining} | {postfix}",
+                mininterval=2.0, miniters=1, dynamic_ncols=True)
+
+    for anime in pbar:
+        anime_id = anime["anime_id"]
+        source_url = source_url_by_id.get(anime_id)
+        if not source_url:
+            continue
+        title = anime.get("title", f"id={anime_id}")
+        short = title[:30] + ("..." if len(title) > 30 else "")
+        stats["animes_processed"] += 1
+
+        state_entry = state["animes_scraped"].get(source_url, {})
+        # 1. AniList (primaire) + Jikan (fallback) — récupérer mal_id si pas déjà cached
+        mal_id = state_entry.get("mal_id")
+        already_fetched = state_entry.get("mal_id_fetched", False)
+
+        if not mal_id and not already_fetched:
+            pbar.set_postfix_str(f"AniList: {short}")
+            mal_id, source = await fetch_mal_id(client, title)
+            stats["jikan_queries"] += 1  # on garde le nom pour compat (mais = AniList+Jikan)
+
+            state_entry["mal_id"] = mal_id
+            state_entry["mal_id_fetched"] = True
+            state_entry["mal_source"] = source  # 'anilist' | 'jikan' | 'none'
+            state["animes_scraped"][source_url] = state_entry
+
+            if mal_id:
+                stats["mal_found"] += 1
+                log.info("  ✓ %s: %s → mal_id=%d", source.upper(), short, mal_id)
+                c.execute("UPDATE anime SET mal_id=?, mal_id_fetched=1 WHERE anime_id=?",
+                          (mal_id, anime_id))
+            else:
+                stats["mal_not_found"] += 1
+                log.warning("  ✗ AniList+Jikan: %s → mal_id non trouvé", short)
+                c.execute("UPDATE anime SET mal_id_fetched=1 WHERE anime_id=?", (anime_id,))
+            conn.commit()
+        elif mal_id:
+            stats["mal_already_cached"] += 1
+            # Restaurer mal_id dans la DB (write_db l'a remis à NULL via INSERT OR REPLACE)
+            c.execute("UPDATE anime SET mal_id=?, mal_id_fetched=1 WHERE anime_id=?",
+                      (mal_id, anime_id))
+            conn.commit()
+        else:
+            # already_fetched=True mais mal_id=None → pas la peine de retry
+            continue
+
+        if not mal_id:
+            continue
+
+        # 2. AniSkip — pour chaque épisode, fetch si pas en DB
+        for season in anime.get("seasons", []) or []:
+            season_number = season.get("season_number", 0)
+            for episode in season.get("episodes", []) or []:
+                ep_num = episode.get("episode_number", 0)
+
+                # Check cache DB
+                existing = c.execute(
+                    "SELECT 1 FROM skip_times WHERE mal_id=? AND episode_number=? LIMIT 1",
+                    (mal_id, ep_num)
+                ).fetchone()
+                if existing:
+                    stats["skip_already_cached"] += 1
+                    continue
+
+                pbar.set_postfix_str(f"{short} E{ep_num}")
+                skip = await fetch_skip_times_via_aniskip(client, mal_id, ep_num)
+                stats["aniskip_queries"] += 1
+                await asyncio.sleep(ANISKIP_DELAY)
+
+                if skip and any(v is not None for v in skip.values()):
+                    stats["skip_found"] += 1
+                    log.info("  ✓ AniSkip: %s E%d intro=%s-%s outro=%s-%s",
+                             short, ep_num,
+                             skip["intro_start"], skip["intro_end"],
+                             skip["outro_start"], skip["outro_end"])
+
+                # INSERT même si skip=None → marque l'épisode comme "déjà query"
+                # pour pas le re-fetch au prochain run
+                c.execute("""
+                    INSERT OR REPLACE INTO skip_times
+                    (anime_id, mal_id, season_number, episode_number,
+                     intro_start, intro_end, outro_start, outro_end, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    anime_id, mal_id, season_number, ep_num,
+                    skip["intro_start"] if skip else None,
+                    skip["intro_end"] if skip else None,
+                    skip["outro_start"] if skip else None,
+                    skip["outro_end"] if skip else None,
+                    int(time.time()),
+                ))
+                conn.commit()
+
+        # Save state tous les 5 animes (pour pas tout perdre en cas de crash)
+        if stats["animes_processed"] % 5 == 0:
+            save_state(args_state_path, state) if args_state_path else None
+
+    conn.close()
+    pbar.close()
+
+    log.info("\n--- Stats Enrichissement AniSkip ---")
+    log.info("  Animes traités : %d", stats["animes_processed"])
+    log.info("  Jikan queries  : %d (mal trouvés: %d, déjà cached: %d, non trouvés: %d)",
+             stats["jikan_queries"], stats["mal_found"],
+             stats["mal_already_cached"], stats["mal_not_found"])
+    log.info("  AniSkip queries : %d (skip trouvés: %d, déjà cached: %d)",
+             stats["aniskip_queries"], stats["skip_found"], stats["skip_already_cached"])
+    return stats
+
+
+# Variable globale sale pour permettre à enrich_with_skip_times de save_state
+# sans avoir à refiler args.state partout. Mis à jour dans run_scraper.
+args_state_path = None
+
+
 async def run_scraper(args):
     state_path = args.state
     db_path = args.db
@@ -901,6 +1403,19 @@ async def run_scraper(args):
     log.info("State chargé : %d animes déjà connus, dernier scrape il y a %d min",
              len(state["animes_scraped"]),
              (int(time.time()) - state["last_incremental_scrape"]) // 60)
+
+    # Beta 1.1 : --force-refresh-mal reset le cache mal_id pour forcer un re-fetch.
+    # Utile pour récupérer d'un state pollué par d'anciens échecs (Jikan 504 etc.).
+    if getattr(args, "force_refresh_mal", False):
+        reset_count = 0
+        for url, info in state["animes_scraped"].items():
+            if info.get("mal_id_fetched") or info.get("mal_id"):
+                info["mal_id"] = None
+                info["mal_id_fetched"] = False
+                reset_count += 1
+        log.info("⚠️  --force-refresh-mal : %d animes reset (mal_id_fetched=False)",
+                 reset_count)
+        save_state(state_path, state)
 
     if args.no_scrap:
         log.info("Mode --no-scrap : conversion du state en DB uniquement")
@@ -918,7 +1433,13 @@ async def run_scraper(args):
             log.error("Abandon : domaine introuvable")
             return
 
-        all_catalogues = await fetch_all_catalogues(client, site_url, max_animes)
+        # Beta 1.1 : si --anime-name fourni, on le passe à fetch_all_catalogues
+        # pour qu'elle break dès qu'un match est trouvé (évite de scanner 279 pages).
+        anime_name_filter = getattr(args, "anime_name", None)
+
+        all_catalogues = await fetch_all_catalogues(
+            client, site_url, max_animes, name_filter=anime_name_filter
+        )
         if not all_catalogues:
             log.error("Catalogue vide — abandon")
             return
@@ -926,7 +1447,11 @@ async def run_scraper(args):
         # V2.15 : tous les animes du catalogue sont scrapés (le state ne sert
         # plus qu'au cache). On peut ajouter une option --incremental plus tard
         # pour skip les animes scrapés il y a moins de X heures.
+        # Beta 1.1 : si --anime-name était fourni, all_catalogues ne contient
+        # déjà QUE les matchs (fetch_all_catalogues a filtré + break). Donc pas
+        # besoin de re-filtrer ici.
         catalogues_to_scrape = all_catalogues
+
         if max_animes:
             catalogues_to_scrape = catalogues_to_scrape[:max_animes]
 
@@ -947,10 +1472,16 @@ async def run_scraper(args):
             url = cat["url"]
             # V2.15 : anime_id STABLE via hash MD5 de l'URL
             anime_id = stable_anime_id(url)
+            # Beta 1.1 : préserver mal_id + mal_id_fetched si l'anime était déjà
+            # dans le state (sinon on perd le cache Jikan à chaque run).
+            existing_entry = state["animes_scraped"].get(url, {})
             state["animes_scraped"][url] = {
                 "anime_id": anime_id,
                 "name": cat["name"],
                 "last_scraped": int(time.time()),
+                "mal_id": existing_entry.get("mal_id"),
+                "mal_id_fetched": existing_entry.get("mal_id_fetched", False),
+                # "data" sera remis juste après
             }
 
             short_name = cat["name"][:40] + ("..." if len(cat["name"]) > 40 else "")
@@ -1004,6 +1535,33 @@ async def run_scraper(args):
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({"anime": animes_out}, f, ensure_ascii=False, indent=2)
 
+        # Beta 1.1 : phase d'enrichissement AniSkip (skip intro/outro).
+        # On construit le mapping anime_id → source_url pour pouvoir retrouver
+        # l'entrée state (qui contient le cache mal_id).
+        # Skip avec --skip-enrich pour tests rapides.
+        enrich_stats = None
+        if getattr(args, "skip_enrich", False):
+            log.info("Phase AniSkip skipée (--skip-enrich)")
+        else:
+            source_url_by_id = {}
+            for url, info in state["animes_scraped"].items():
+                if "anime_id" in info and info.get("data"):
+                    source_url_by_id[info["anime_id"]] = url
+
+            # Set global pour que enrich_with_skip_times puisse save_state
+            global args_state_path
+            args_state_path = state_path
+
+            try:
+                enrich_stats = await enrich_with_skip_times(
+                    client, db_path, state, animes_out, source_url_by_id
+                )
+            except Exception as e:
+                log.error("Phase enrich_with_skip_times échouée: %s", e)
+
+        # Save state final (avec tous les mal_id cached)
+        save_state(state_path, state)
+
         log.info(
             "\n✅ Scrap terminé\n"
             "   Requêtes HTTP : %d\n"
@@ -1015,6 +1573,13 @@ async def run_scraper(args):
             client.req_count, new_count, updated_count, unchanged_count,
             len(animes_out), int(time.time()) - start_time,
         )
+        if enrich_stats:
+            log.info(
+                "   AniSkip : %d Jikan queries (%d cached), %d AniSkip queries (%d cached), %d skip trouvés",
+                enrich_stats["jikan_queries"], enrich_stats["mal_already_cached"],
+                enrich_stats["aniskip_queries"], enrich_stats["skip_already_cached"],
+                enrich_stats["skip_found"],
+            )
     finally:
         client.close()
 
@@ -1026,6 +1591,16 @@ def main():
     parser.add_argument("--state", default="state.json", help="Chemin state.json persistant")
     parser.add_argument("--max-animes", type=int, default=None, help="Limite (pour test)")
     parser.add_argument("--no-scrap", action="store_true", help="Convertir state → DB sans scraper")
+    parser.add_argument("--anime-name", default=None,
+                        help="Beta 1.1 : ne scraper que les animes dont le titre contient "
+                             "cette substring (ex: --anime-name 'jujutsu' pour tester JJK)")
+    parser.add_argument("--skip-enrich", action="store_true",
+                        help="Beta 1.1 : skip la phase AniSkip (Jikan + skip_times). "
+                             "Utile pour test rapide ou si AniSkip est down.")
+    parser.add_argument("--force-refresh-mal", action="store_true",
+                        help="Beta 1.1 : reset mal_id_fetched=False pour tous les animes "
+                             "du state. Force un re-fetch Jikan/AniList au prochain enrich. "
+                             "Utile pour récupérer d'un state pollué par d'anciens échecs.")
 
     # Options HuggingFace sync
     parser.add_argument("--hf", help="Token HuggingFace pour sync cloud")
@@ -1086,17 +1661,37 @@ def main():
             manifest = {
                 "db_version": int(time.time()),
                 "last_update": int(time.time()),
+                "schema_version": 2,  # Beta 1.1 : schema v2 (avec skip_times + mal_id)
                 "total_animes": c.execute("SELECT COUNT(*) FROM anime").fetchone()[0],
                 "total_episodes": c.execute("SELECT COUNT(*) FROM episode").fetchone()[0],
                 "total_urls": c.execute("SELECT COUNT(*) FROM episode_url").fetchone()[0],
                 "db_sha256": sha256.hexdigest(),
             }
+            # Beta 1.1 : stats enrichissement AniSkip
+            try:
+                manifest["animes_with_mal_id"] = c.execute(
+                    "SELECT COUNT(*) FROM anime WHERE mal_id IS NOT NULL"
+                ).fetchone()[0]
+                manifest["skip_times_count"] = c.execute(
+                    "SELECT COUNT(*) FROM skip_times"
+                ).fetchone()[0]
+                manifest["skip_times_with_intro"] = c.execute(
+                    "SELECT COUNT(*) FROM skip_times WHERE intro_start IS NOT NULL"
+                ).fetchone()[0]
+                manifest["skip_times_with_outro"] = c.execute(
+                    "SELECT COUNT(*) FROM skip_times WHERE outro_start IS NOT NULL"
+                ).fetchone()[0]
+            except Exception as e:
+                log.warning("Stats skip_times non disponibles: %s", e)
+                manifest["animes_with_mal_id"] = 0
+                manifest["skip_times_count"] = 0
             conn.close()
             with open("/tmp/manifest.json", "w") as f:
                 json.dump(manifest, f, indent=2)
             hf_api.upload_file(path_or_fileobj="/tmp/manifest.json", path_in_repo="manifest.json", repo_id=hf_repo, repo_type="dataset")
-            log.info("✓ manifest.json pousse: %d animes, %d eps, sha256=%s...",
-                     manifest["total_animes"], manifest["total_episodes"], manifest["db_sha256"][:16])
+            log.info("✓ manifest.json pousse: %d animes, %d eps, %d skip_times, sha256=%s...",
+                     manifest["total_animes"], manifest["total_episodes"],
+                     manifest.get("skip_times_count", 0), manifest["db_sha256"][:16])
 
 
 if __name__ == "__main__":
